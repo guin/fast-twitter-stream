@@ -1,10 +1,6 @@
-use Coro;
-use Coro::Channel;
-use Coro::AnyEvent;
 use AnyEvent::Twitter::Stream;
 use Plack::Request;
 use Plack::Builder;
-use IO::Handle::Util qw(io_from_getline);
 use Encode;
 
 my $username = $ENV{TWITTER_USERNAME};
@@ -14,27 +10,39 @@ my $app = sub {
     my $env = shift;
     my $req = Plack::Request->new($env);
 
+    warn "This app needs a server that supports psgi.streaming"
+        unless $env->{'psgi.streaming'};
+
     if ( $req->path eq '/push' ) {
-        my $queue    = Coro::Channel->new;
+        my $cv       = AE::cv;
         my $streamer = AnyEvent::Twitter::Stream->new(
             username => $username,
             password => $password,
             method   => 'filter',
-            track => 'twitter',
-            on_tweet => sub {
-                $queue->put(@_);
-            },
+            track    => 'twitter',
+            on_tweet => sub { $cv->send(@_) },
         );
-        my $body = io_from_getline sub {
-            my $tweet = $queue->get;
-            if( $tweet->{text} ){
-                return "--$boundary\nContent-Type: text/html\n" .
-                    Encode::encode_utf8( $tweet->{text} );
-            }else{
-                return '';
-            }
-        };
-        return [ 200, ['Content-Type' => qq{multipart/mixed; boundary="$boundary"} ], $body ];
+        return sub {
+            my $respond = shift;
+            my $w  = $respond->([
+                200,
+                [ 'Content-Type' => qq{multipart/mixed; boundary="$boundary"} ]
+            ]);
+            my $cb;
+            $cb = sub {
+                my $tweet = shift->recv;
+                my $body  = '';
+                if ( $tweet->{text} ) {
+                    $body =
+                        "--$boundary\nContent-Type: text/html\n"
+                            . Encode::encode_utf8( $tweet->{text} );
+                }
+                $w->write($body);
+                $cv = AE::cv;
+                $cv->cb( $cb );
+            };
+            $cv->cb( $cb );
+        }
     }
     if ( $req->path eq '/' ) {
         my $res = $req->new_response(200);
